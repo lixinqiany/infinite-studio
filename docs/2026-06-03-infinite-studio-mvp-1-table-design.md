@@ -1,7 +1,8 @@
 # Infinite Studio（万能 AI 工坊）MVP-1 表设计文档
 
 - 日期：2026-06-03（聚焦第一期 MVP 的数据库表设计定稿）
-- 状态：表设计定稿。**本文档正文只覆盖第一期 MVP 的 12 张表及其主键/约束纪律**；计费、负载均衡、应用中心、OAuth/RBAC、规模化等**所有未来演进**集中在末章 §8「未来演进（分块导论）」，仅留方向与要点 hint。
+- 状态：表设计定稿。**本文档正文只覆盖第一期 MVP 的 13 张表及其主键/约束纪律**；计费、负载均衡、应用中心、OAuth/RBAC、规模化等**所有未来演进**集中在末章 §8「未来演进（分块导论）」，仅留方向与要点 hint。
+- 修订：2026-06-05 —— `run` 幂等键作用域改为 `(user_id, key)` 并定主业务必传；`item` 砍 `final` 类型、改用 `is_answer` 标记交付答案；明确 `content` 判别联合边界（工具形状留 `dict`）；`reasoning` 存「归一摘要 + 按 family 原样存的回放 blob」，修正回灌纪律（摘要不喂模型，但工具循环内 signature 必须原样回放）。
 
 ---
 
@@ -57,19 +58,24 @@
 ### 2.2 跨表约定
 
 - **时间**：所有时间列 `timestamptz`，全程按 **UTC**（仅前端展示转本地）。
-- **枚举**：用 `varchar + CHECK`（不用原生 enum；SQLAlchemy `Enum(native_enum=False)`）。
+- **枚举**：DB 用 `varchar + CHECK`（避开 PG 原生 enum 演进痛），但**取值集以 Python `StrEnum` 为单一事实源**——全局 import 使用、**禁裸字符串字面量**；SQLAlchemy 映射 `Enum(MyEnum, native_enum=False)`，DB 的 `CHECK(IN ...)` **由 enum 自动派生、与代码不漂移**。
+  - 仅适用于**闭合、代码拥有**的取值集：`role` / `status` / `run.status` / `item.type` / `runtime_pattern` / `usage_type` / `model_family` 等。
+  - **不适用**于**注册表式动态标识**（`agent_identifier` / `tool_identifier` / `model_name`）——它们是**表里的行/数据**，靠 `UNIQUE` + 应用层校验，**不做 CHECK 枚举**。
+  - 判断边界：取值集由**代码闭合**→ enum；取值是**注册表/admin 增长的标识**→ 数据。Alembic：给 enum 加值 = 改 `StrEnum` + 一条迁移同步 CHECK（事实源始终是 enum）。
 
 ### 2.3 主键纪律（对齐业界主流）
 
 - **每张实体表**一律 `id bigint GENERATED ALWAYS AS IDENTITY` 做 PK——**注册表也不例外**（不拿自然键当 PK）。用 `IDENTITY` 而非旧 `serial`；用 `bigint` 而非 `int`（int4 21 亿溢出是经典事故）。
-- **自然键**（`username` / `model_name` / `agent_code` / `tool_identifier` …）按**真实语义命名** + `UNIQUE NOT NULL`，不强行统一成 `key`（避开 SQL 关键字）。别的表按它引用时，FK 可直接指这列（Postgres 允许 FK 指任意**完整** `UNIQUE` 列）；标识可能改名的配 `ON UPDATE CASCADE`。⚠️ 部分唯一索引（`UNIQUE(...) WHERE ...`）**不能**当 FK 目标。
+- **自然键**（`username` / `model_name` / `agent_identifier` / `tool_identifier` …）按**真实语义命名** + `UNIQUE NOT NULL`，不强行统一成 `key`（避开 SQL 关键字）。别的表按它引用时，FK 可直接指这列（Postgres 允许 FK 指任意**完整** `UNIQUE` 列）；标识可能改名的配 `ON UPDATE CASCADE`。⚠️ 部分唯一索引（`UNIQUE(...) WHERE ...`）**不能**当 FK 目标。
+- **引用列命名 = 被引用的自然键列名（两侧同名，关系一目了然）**：引用注册表自然键的列就叫 `agent_identifier` / `tool_identifier` / `model_name`（如 `run.agent_identifier`、`item.tool_identifier`、`agent.allowed_tool_identifiers`）；指向代理键的内部 FK 用 `<表>_id`（如 `user_id`、`conversation_id`）。注册表自然键统一 `_identifier` 后缀（`model` 例外，用 `model_name`——字面就是模型名；注意 `model.model_identifier` 是另一字段=供应商侧真实串，勿混）。
 - **对外暴露的资源**（会进 URL/API，如 `conversation` / `run`）加 `public_id uuid UNIQUE`，用 **UUIDv7**（时间有序，Postgres 18 原生 `uuidv7()`；<18 用扩展或应用层生成）。**对外只暴露 `public_id`，顺序 `id` 绝不进 URL**（防枚举/IDOR/泄露体量）。纯内部表（provider / model / usage_event 等）不需要。
+- **UUID 一律用 Postgres 原生 `uuid` 类型存**（16 字节，非 varchar；"v7" 是值的版本、不是列类型）。`public_id` 可 **DB 默认 `uuidv7()`**（PG18）；但**幂等键**（`usage_event.request_id` / `run.client_idempotency_key`）**必须应用层生成 v7**（如 `uuid-utils`）、**调用时生成一次、重试复用、无 DB 默认**——DB 默认每次插入新发会让幂等失效。SQLAlchemy 用 `Uuid` 映射原生 `uuid`。
 - **关联表例外**：纯多对多中间表（如未来 RBAC 的 `role_permission`，§8.6）用复合主键，不另设 `id`。本期无此类表。
 - **分库（一句保险，现在不做、不为它设计）**：真到分库那天，只把 id 生成从 IDENTITY 换成分布式发号（Snowflake / Instagram 式），`bigint` 类型与表结构不变。
 
 ---
 
-## 3. 数据模型（12 张表）
+## 3. 数据模型（13 张表）
 
 采用 **`conversation → run → item` 三级模型**（对齐 OpenAI Agents SDK 的 Session→Run→Item）。为未来预留的字段先做成可空普通列，后续 Alembic 补外键。
 
@@ -87,6 +93,7 @@
 | 3.10 | 对话 | `run` | 一次执行 |
 | 3.11 | 对话 | `item` | run 内有序事件（只追加） |
 | 3.12 | 用量 | `usage_event` | 模型 + 工具用量快照（**记录、不扣费**） |
+| 3.13 | 平台 | `system_setting` | 单例配置 KV（主业务→agent 绑定等） |
 
 ### 3.1 `users` —— 用户账户
 
@@ -173,17 +180,17 @@ created_at          timestamptz   NOT NULL, default now()
 
 **核心范式（业界印证：OpenAI/Claude Agent SDK、Dify）：逻辑在代码、定义是声明式数据。** 编排逻辑（react_loop 等）写死在代码的「运行时模式」里；agent = 选一个模式 + 一套声明式配置。管理员改提示词 = 改 DB 配置，**不重新部署**。这不是低代码平台——admin 只能编辑已写好逻辑的 agent 的定义字段，不能凭空造逻辑。
 
-（= DB 版的 AgentDefinition；代理键 `id` 做 PK，`agent_code` 唯一）
+（= DB 版的 AgentDefinition；代理键 `id` 做 PK，`agent_identifier` 唯一）
 ```
 id              bigint   PK
-agent_code      varchar  NOT NULL, UNIQUE    稳定引用键（代码 resolve_agent('chat')、run.agent_key 按它引用；不可变）
+agent_identifier      varchar  NOT NULL, UNIQUE    稳定引用键（代码 resolve_agent('chat')、run.agent_identifier 按它引用；不可变）
 name            varchar  NOT NULL            展示名
 description     varchar  NULL                 （未来 handoff 路由"何时该用我"）
 runtime_pattern varchar  NOT NULL  CHECK IN ('react')   代码已注册逻辑；MVP 仅单 agent+工具循环（纯对话=空工具）
 model           varchar  NULL                 引用 model.model_name；**无代码默认**，解析时为空/失效则报错（fail-fast）
 instructions    text     NULL                 系统提示词；**NULL = 继承代码默认**（overlay）
 model_params    jsonb    NOT NULL default '{}'  不规则采样参数(temperature/top_p/...)
-allowed_tool_keys text[] NOT NULL default '{}' 可调工具（引用 tool.tool_identifier，如 ['tavily_search']）
+allowed_tool_identifiers text[] NOT NULL default '{}' 可调工具（引用 tool.tool_identifier，如 ['tavily_search']）
 max_turns       int      NOT NULL default 1     工具循环步数上限（纯对话=1）
 enabled         boolean  NOT NULL default true
 created_at      timestamptz NOT NULL default now()
@@ -193,12 +200,14 @@ updated_at      timestamptz NOT NULL default now()
 - `instructions` 可空 → **NULL 继承代码默认提示词**（prompt 可缺省）。
 - `model` 无代码默认 → 未配/失效 **解析时报错**，绝不回退内置（密钥/模型这种关键项不许内置）。
 
+> **业务绑定不在本表**：「哪个业务用哪个 agent」由**消费者侧**指定——内置主业务 → `system_setting.main_chat_agent_identifier`（§3.13）；未来 app → `app.backing_ref`（§8.4）。agent 保持**业务无关、可复用**，同一个 agent 可被主业务与多个 app 共用。
+
 ### 3.6 `tool` —— 工具注册表
 
 （code-first 目录；代理键 `id` 做 PK，`tool_identifier` 唯一）
 ```
 id            bigint   PK
-tool_identifier     varchar  NOT NULL, UNIQUE    代码写死的不可变标识；agent.allowed_tool_keys / item.tool_key / LLM 都按它引用
+tool_identifier     varchar  NOT NULL, UNIQUE    代码写死的不可变标识；agent.allowed_tool_identifiers / item.tool_identifier / LLM 都按它引用
 name          varchar  NOT NULL            展示名
 description   text     NULL                给 LLM 看的"何时用我"
 input_schema  jsonb    NOT NULL            参数 JSON Schema
@@ -212,7 +221,7 @@ updated_at    timestamptz NOT NULL default now()
 
 **写入/留存生命周期（`agent` / `tool` 两表机制不同，黄金法则：启动绝不覆盖「人配的那一层」）：**
 - **`tool`（代码拥有定义、admin 只调策略）**：启动按 `tool_identifier` upsert。**代码字段**（name/description/schema）随代码刷新（保 LLM 看到的工具说明不过时）；**`enabled`** 永不动；**`metadata`** 按 key 合并——代码模板里 DB 缺的 key 补进来（带占位值），DB 已有的 key **一律不覆盖** → 新可配项自动出现在后台、admin 填过的值不丢。代码删工具 → 标 deprecated/禁用不硬删；代码加工具 → 下次启动出现。
-- **`agent`（代码兜底 + DB 覆盖）**：启动**不写** agent 表。`resolve_agent(agent_code)` = **DB 行 ?? 代码默认(提示词/逻辑) ?? 全局 fallback**。`model` 必须由配置提供（无代码默认 → 缺则报错）。**启动从不覆盖 admin 的行 → 配过的提示词跨部署存活**。
+- **`agent`（代码兜底 + DB 覆盖）**：启动**不写** agent 表。`resolve_agent(agent_identifier)` = **DB 行 ?? 代码默认(提示词/逻辑) ?? 全局 fallback**。`model` 必须由配置提供（无代码默认 → 缺则报错）。**启动从不覆盖 admin 的行 → 配过的提示词跨部署存活**。
 
 ### 3.7 `provider` —— 供应商连接
 
@@ -263,14 +272,15 @@ id              bigint       PK
 public_id       uuid         NOT NULL, UNIQUE, default uuidv7()   对外暴露用（URL/API）；顺序 id 不出库
 user_id         bigint       NOT NULL, FK→users(id)
 conversation_id bigint       NULL, FK→conversation(id)   属于哪个会话
-agent_key       varchar      NOT NULL, default 'chat'    这次哪个 agent 在跑（agent.agent_code 的快照，不设 FK：历史记录不随改名/删除而变）
+agent_identifier       varchar      NOT NULL, default 'chat'    这次哪个 agent 在跑（agent.agent_identifier 的快照，不设 FK：历史记录不随改名/删除而变）
 status          varchar      NOT NULL, default 'running' CHECK IN ('running','completed','failed')
-input           jsonb        NULL                        本次输入快照
+client_idempotency_key uuid  NULL                        客户端幂等键（应用层生成）：双击/重试同 key → 返回已存在 run，不新建；唯一性按 (user_id, key) 隔离到用户；主业务 POST /runs 必传
 created_at      timestamptz  NOT NULL default now()
 finished_at     timestamptz  NULL
 【预留】type, source, app_key, parent_run_id, thread_id（未来多 agent/应用中心）
 ```
-索引：`UNIQUE(public_id)`；`INDEX(conversation_id, created_at)`；`INDEX(user_id, created_at)`。
+索引：`UNIQUE(public_id)`；`UNIQUE(user_id, client_idempotency_key) WHERE client_idempotency_key IS NOT NULL`（幂等作用域隔离到用户、防跨用户撞 key；NULL 不去重，PG 允许多 NULL）；`INDEX(conversation_id, created_at)`；`INDEX(user_id, created_at)`。
+> **三层幂等**：run 级 `client_idempotency_key`（防双击/重试建多 run）→ 调用级 `usage_event.request_id`（防重复记/扣）→ 事件级 `UNIQUE(run_id, seq)`（防重复 item）。`id` 只负责标识，**防重复创建必须靠幂等键**（id 每次插入新发，挡不住重试）。
 
 ### 3.11 `item` —— run 内有序事件
 
@@ -279,15 +289,23 @@ finished_at     timestamptz  NULL
 id          bigint       PK
 run_id      bigint       NOT NULL, FK→run(id)
 seq         int          NOT NULL                run 内顺序
-type        varchar      NOT NULL                CHECK IN ('message','tool_call','tool_output','reasoning','final')
-role        varchar      NULL                    'user'|'assistant'|'system'|'tool'
-content     jsonb        NOT NULL                多态内容
-tool_key    varchar      NULL                    type='tool_call'/'tool_output' 时：哪个工具（引用 tool.tool_identifier）
+type        varchar      NOT NULL                CHECK IN ('message','reasoning','tool_call','tool_output')；四种不同形状的事件
+role        varchar      NULL                    'user'|'assistant'|'system'|'tool'；type='message' 时非空（应用层约束）
+content     jsonb        NOT NULL                多态内容；形状由 type 判别，应用层 Pydantic 判别联合取强类型（对齐 §3.12 usage）
+is_answer   boolean      NOT NULL default false  这条是否本 run 的交付答案（正交角色标记、非类型）：react_loop 收尾那条 message 插入时设 true，中间 assistant 文字为 false
+tool_identifier    varchar      NULL                    type='tool_call'/'tool_output' 时：哪个工具（引用 tool.tool_identifier）
+call_id     uuid         NULL                    同一次 LLM/工具调用产出的 item 共享（= 该调用 usage_event.request_id）：分组、对齐 usage、未来 step 级续跑去重
 created_at  timestamptz  NOT NULL default now()
-【预留】agent_key, step_index, artifact_id
+【预留】agent_identifier, step_index, artifact_id
 ```
-索引：`UNIQUE(run_id, seq)`；`INDEX(run_id, seq)`。重建一次运行 = `SELECT * FROM item WHERE run_id=? ORDER BY seq`。
+索引：`UNIQUE(run_id, seq)`；`UNIQUE(run_id) WHERE is_answer`（一个 run 至多一条交付答案）；`INDEX(run_id, seq)`。重建一次运行 = `SELECT * FROM item WHERE run_id=? ORDER BY seq`。
 > 用量不放 item，统一进 `usage_event`，靠 `item_id` 关联。
+> **幂等**：item 靠 `UNIQUE(run_id, seq)` 防重复，不需 request_id。**用户消息 = item seq=1**（role='user'，时间线事实源）。
+> **type 四独立项（对齐 OpenAI Responses / Agents SDK 的扁平事件流）**：`message`/`reasoning`/`tool_call`/`tool_output` 各自一行，靠 `call_id` 把同一次 LLM 调用的几行分组。**reasoning 不并进 message**（流式 grain、签名回放语义、append-only 各不同）；**中间 assistant 文字是 `message` 不是 reasoning**（前者用户可见、当文字回灌；后者内部思考、当 signature 回灌）。**「哪条是答案」用 `is_answer` 标，不开新 type**——它与中间 message 同 role、同 content 形状、同渲染、同回灌，只是角色不同（正交属性，非类型）。
+> **content 判别联合**：判别器 = `type`，应用层 Pydantic 判别联合取强类型（同 §3.12 usage）。`message`/`reasoning`/答案文字这类**自己拥有的**结构钉死强类型；`tool_call.arguments` / `tool_output.output` 形状由 `tool.input_schema/output_schema` 决定 → content 层留 `dict` 不展开，强类型让给工具自身 schema 层（呼应 usage 的克制：自己拥有的钉死、别人拥有的留口）。
+> **reasoning 内容**：三家（Anthropic/OpenAI/Google）都只给「思考摘要 + 不透明加密回放令牌」、不暴露原始 CoT。故 reasoning content 存两样——① 归一化摘要 `summary`（给人看/审计）；② 按 `model_family` 原样存的回放 blob（Anthropic `signature` / Gemini `thoughtSignature` / OpenAI `encrypted_content` + `rs_` id），**不解析、原样回放**。
+> **持久 item vs 模型输入**：持久化的 item 是事实源（渲染/审计/计费）；喂模型的是**另行组装**的输入（items→messages）。**reasoning 摘要默认不喂模型**；但**工具循环内必须把 reasoning 的 signature 原样回放**——Anthropic/Gemini 在「thinking + 工具调用」时缺签名会直接报错，OpenAI 亦建议回传 reasoning item（参考各家 reasoning 重放策略）。
+> **粒度解耦**：后端按事件细存（item/usage 每调用一条），前端按 run 聚合展示（`is_answer` 那条 = 答案、reasoning/tool 过程可展开）；存储粒度与展示粒度互不绑定。
 
 ### 3.12 `usage_event` —— 精确用量
 
@@ -301,7 +319,7 @@ usage_type  varchar      NOT NULL                    判别器（= 未来 chargi
                                                      模型 'anthropic_messages'|'openai_chat'|'gemini'… / 工具 'tavily_search'…
 usage       jsonb        NOT NULL                    原始用量，形状由 usage_type 决定（Pydantic 判别联合；含模型名/工具 key 标识）
 status      varchar      NOT NULL, default 'success' CHECK IN ('success','failed')
-request_id  varchar      NOT NULL, UNIQUE            幂等（防重复记录）
+request_id  uuid         NOT NULL, UNIQUE            每次调用的幂等键（UUIDv7，应用层生成一次、重试复用、无 DB 默认）；= 对应 item.call_id
 created_at  timestamptz  NOT NULL
 ```
 索引：`UNIQUE(request_id)`；`INDEX(user_id, created_at)`；`INDEX(run_id)`；`INDEX(item_id)`；`INDEX(usage_type)`。
@@ -309,20 +327,101 @@ created_at  timestamptz  NOT NULL
 - **不归一化**：各家用量形状不同（Anthropic input/output + cache 5m/1h/read、OpenAI prompt/completion/cached/reasoning、Gemini…、tavily 搜索次数），原样按 `usage_type` 进 `usage`，用 **Pydantic 判别联合**在应用层取强类型（= TS 的 `type`+`payload`）。
 - 一次 chat turn 调了 tavily：会有**多条 item + 多条 usage_event**（LLM 调用各一条 token、tavily 一条搜索次数），全挂同一 `run_id`，靠 `item_id` 溯源。
 - **预留**（未来计费，§8.1）：`provider` 快照、`billing_status`（异步结算接缝）、定价快照、`credits_charged`、`cost`。
+- **三套字段三件事**：`id` 标识 + 关联扣费（未来 `credit_ledger.ref_id` 指 `usage_event.id`）；**追溯**走 `run_id`/`item_id`（→ item/run/conversation/user）；**幂等/对外反查**走 `request_id`。同步 MVP 下 run 级幂等已防重复轮，`request_id` 的去重价值在**异步上报**阶段（§8.1，at-least-once 重投去重）显现——本期照常生成、记录。
 
 **Pydantic 判别联合（`usage` 的应用层类型）：**
 ```python
-class AnthropicMessagesUsage(BaseModel):
-    type: Literal["anthropic_messages"]; input_tokens: int; output_tokens: int
-    cache_creation_5m_tokens: int = 0; cache_creation_1h_tokens: int = 0; cache_read_tokens: int = 0
-class OpenAIChatUsage(BaseModel):
-    type: Literal["openai_chat"]; prompt_tokens: int; completion_tokens: int
-    cached_tokens: int = 0; reasoning_tokens: int = 0
-class TavilySearchUsage(BaseModel):
-    type: Literal["tavily_search"]; search_count: int
-Usage = Annotated[Union[AnthropicMessagesUsage, OpenAIChatUsage, TavilySearchUsage, ...],
-                  Field(discriminator="type")]
+from enum import StrEnum
+from typing import Annotated, Literal, Union
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+
+class UsageType(StrEnum):                          # = usage_event.usage_type 列的值（单一事实源）
+    ANTHROPIC_MESSAGES = "anthropic_messages"
+    OPENAI_CHAT        = "openai_chat"
+    OPENAI_IMAGE       = "openai_image"     # gpt-image-1：形状与 chat 不同，单列
+    GEMINI_CONTENT     = "gemini_content"   # generateContent，覆盖文本+图片（模态在 *TokensDetails 区分，不拆）
+    # 后续：tavily_search 等工具
+    
+
+class UsageBase(BaseModel):
+    # populate_by_name：可直接喂原厂 camelCase（Gemini）；extra="allow"：未建模字段原样留 jsonb（记录原厂格式、不丢、可后补类型）
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+    usage_type: UsageType                           # 判别器（子类用 Literal 固定）
+
+# ── 嵌套子模型 ──
+class ModalityTokenCount(BaseModel):                # Gemini *TokensDetails 的元素
+    modality: str                                   # 'TEXT' | 'IMAGE' | 'AUDIO' | 'VIDEO' | 'DOCUMENT' 要用python 枚举
+    token_count: int = Field(alias="tokenCount")
+
+class AnthropicCacheCreation(BaseModel):            # Anthropic 缓存写 5m/1h 拆分
+    ephemeral_5m_input_tokens: int = 0
+    ephemeral_1h_input_tokens: int = 0
+
+class OpenAIChatInputDetails(BaseModel):            # OpenAI(Responses) input_tokens_details
+    cached_tokens: int = 0                          # 命中缓存（input 的子集）
+class OpenAIChatOutputDetails(BaseModel):           # output_tokens_details
+    reasoning_tokens: int = 0                       # o 系列推理（output 的子集）
+class OpenAIImageInputDetails(BaseModel):           # gpt-image-1 input_tokens_details
+    text_tokens: int = 0
+    image_tokens: int = 0                           # 编辑时输入图片 token
+
+# ── 各供应商用量（原生字段、不归一；含义见注释）──
+class AnthropicMessagesUsage(UsageBase):
+    usage_type: Literal[UsageType.ANTHROPIC_MESSAGES] = UsageType.ANTHROPIC_MESSAGES
+    input_tokens: int                               # 不含缓存
+    output_tokens: int
+    cache_creation_input_tokens: int = 0            # 缓存写入总量（与 input 相加）
+    cache_read_input_tokens: int = 0                # 缓存读取（命中）
+    cache_creation: AnthropicCacheCreation | None = None   # 5m/1h 拆分（用扩展缓存时）
+
+class OpenAIChatUsage(UsageBase):
+    usage_type: Literal[UsageType.OPENAI_CHAT] = UsageType.OPENAI_CHAT
+    input_tokens: int                               # 含缓存（cached 是子集）
+    output_tokens: int                              # 含 reasoning（reasoning 是子集）
+    total_tokens: int | None = None
+    input_tokens_details: OpenAIChatInputDetails  = Field(default_factory=OpenAIChatInputDetails)
+    output_tokens_details: OpenAIChatOutputDetails = Field(default_factory=OpenAIChatOutputDetails)
+
+class OpenAIImageUsage(UsageBase):                  # gpt-image-1：与 chat 形状不同
+    usage_type: Literal[UsageType.OPENAI_IMAGE] = UsageType.OPENAI_IMAGE
+    input_tokens: int                               # 文本 + 输入图片 token
+    output_tokens: int                              # 生成图片输出 token
+    total_tokens: int | None = None
+    input_tokens_details: OpenAIImageInputDetails = Field(default_factory=OpenAIImageInputDetails)
+    # 注：gpt-image-1 响应不返回 cached_tokens（计费有缓存折扣但 usage 不暴露），故不建模
+
+class GeminiContentUsage(UsageBase):                # generateContent（文本+图片同形状）
+    usage_type: Literal[UsageType.GEMINI_CONTENT] = UsageType.GEMINI_CONTENT
+    prompt_token_count: int          = Field(alias="promptTokenCount")        # 含缓存，cached_content 是子集
+    candidates_token_count: int      = Field(0, alias="candidatesTokenCount") # 不含 thoughts
+    cached_content_token_count: int  = Field(0, alias="cachedContentTokenCount")
+    thoughts_token_count: int        = Field(0, alias="thoughtsTokenCount")   # thinking；独立，total=prompt+candidates+thoughts
+    total_token_count: int           = Field(0, alias="totalTokenCount")
+    prompt_tokens_details: list[ModalityTokenCount]     = Field(default_factory=list, alias="promptTokensDetails")
+    cache_tokens_details: list[ModalityTokenCount]      = Field(default_factory=list, alias="cacheTokensDetails")
+    candidates_tokens_details: list[ModalityTokenCount] = Field(default_factory=list, alias="candidatesTokensDetails")
+    # 不计 tool（toolUsePromptTokenCount/…）、serviceTier → extra="allow" 原样留 jsonb，用到再补类型
+
+Usage = Annotated[Union[AnthropicMessagesUsage, OpenAIChatUsage, OpenAIImageUsage, GeminiContentUsage],
+                  Field(discriminator="usage_type")]
+usage_adapter = TypeAdapter(Usage)   # 模块级建一次复用
+# 写: 按 usage_type 选对应类 .model_validate(原厂usage) → model_dump() 进 usage 列；usage_event.usage_type = obj.usage_type
+# 读: usage_adapter.validate_python(row.usage) → 强类型
+# 不归一各家 input/output 口径（见注释）；跨家总量到报表层按 usage_type 显式归一；per-kind 成本走策略表
 ```
+
+### 3.13 `system_setting` —— 单例平台配置（KV）
+
+存「全局唯一、admin 可热改、不重部署」的单例配置。MVP 首个用途：**内置主业务（聊天，唯一、非 app）→ agent 的绑定指针**。
+```
+id          bigint       PK
+setting_key varchar      NOT NULL, UNIQUE   配置键（如 'main_chat_agent_identifier'；用 setting_key 避开关键字）
+value       jsonb        NOT NULL           配置值（如 "support-orch"）
+updated_at  timestamptz  NOT NULL default now()
+```
+- **主业务绑定**：`main_chat_agent_identifier` = agent 池里某个 `agent_identifier`（单 agent 或编排器皆可）。用户开聊 → 后端读它 → `resolve_agent(该 code)` → 跑。切换主业务用哪个 agent = 改这一行，立即生效、用户无下拉。
+- **消费者分工**：主业务（唯一、非 app）用本表单条指针绑定；未来多个 **app**（可发布）各自用 `app.backing_type + backing_ref` 绑 tool 或 agent（§8.4）。**agent 池保持业务无关、可复用**——「谁用哪个 agent」永远在消费者侧，不刻在 agent 上。
+- 主键遵循 §2.3 纪律（`id` 做 PK、`setting_key` 作 `UNIQUE`）。也可承载未来其他单例（功能开关等）；非单例/结构化数据不要塞这里。
 
 ---
 
@@ -336,7 +435,7 @@ Usage = Annotated[Union[AnthropicMessagesUsage, OpenAIChatUsage, TavilySearchUsa
 
 **运行时（对话，react_loop）**：
 ```
-前端 POST /runs (input + conversation) → 建 run(agent_key='chat')
+前端 POST /runs (用户消息 + conversation) → 建 run(agent_identifier='chat')
   → resolve_agent('chat')：DB行 ?? 代码默认；解析 model→provider→适配器（缺 model/密钥则报错）
   → react_loop：LLM 调用(写 message item + usage_event) → 若调工具则 tool_call/tool_output item + usage_event → 回灌续跑（≤max_turns）
   → 每段经 SSE 推前端 → run.status=completed
@@ -387,7 +486,8 @@ Usage = Annotated[Union[AnthropicMessagesUsage, OpenAIChatUsage, TavilySearchUsa
 - 更多内置工具、外部工具走 OpenAPI/MCP + 通用适配器；工具计费规则上 `tool`（§8.1）。
 
 ### 8.4 应用中心
-- 前期写死页面；后期模板化+可发布（模板应用/代码应用），`app` 表（ui_kind / backing tool|agent）。
+- 消费者分两类（都引用业务无关的 agent 池，绑定在消费者侧）：**内置主业务**（唯一、非 app）用 `system_setting.main_chat_agent_identifier` 绑定（§3.13）；**app**（多个、可发布）走 `app` 表。
+- `app` 表（后期）：`ui_kind(template|code)` + `backing_type ∈ {tool, agent}` + `backing_ref`（绑某 tool 或某 agent；**不是每个 app 都有 agent**——纯表单型 app 可只绑 tool）。前期应用先写死页面；后期模板化 + 可发布（模板应用/代码应用）。
 
 ### 8.5 模型层演进（多供应商 / 负载均衡）
 - 要 LB/故障转移：① 加 `model_deployment` 绑定表（model×provider，priority/weight/enabled，对标 LiteLLM router / new-api ability），把 model 的 provider 迁入；或 ② **前置网关**（自建 LiteLLM/one-api），`provider.base_url` 指向它，业务库不变。
@@ -409,4 +509,4 @@ Usage = Annotated[Union[AnthropicMessagesUsage, OpenAIChatUsage, TavilySearchUsa
 ---
 
 ## 附 术语速查
-- **run / item**：一次执行 / 其内有序事件。**opaque token / 会话**：随机串当钥匙 + 服务端存会话行（有状态、可即时吊销）。**代理键**：无语义的 `bigint IDENTITY` 主键，全表统一用它做 PK；**自然键**：有语义的稳定标识（`model_name`/`agent_code`/`tool_identifier`…），做 `UNIQUE` 不做 PK，可被 FK 引用；**public_id**：对外暴露的不可枚举 UUIDv7，URL/API 只露它。**runtime_pattern**：代码里的编排逻辑（react_loop…）。**usage_type**：用量/计费判别器，决定 usage payload 形状。
+- **run / item**：一次执行 / 其内有序事件。**opaque token / 会话**：随机串当钥匙 + 服务端存会话行（有状态、可即时吊销）。**代理键**：无语义的 `bigint IDENTITY` 主键，全表统一用它做 PK；**自然键**：有语义的稳定标识（`model_name`/`agent_identifier`/`tool_identifier`…），做 `UNIQUE` 不做 PK，可被 FK 引用；**public_id**：对外暴露的不可枚举 UUIDv7，URL/API 只露它。**runtime_pattern**：代码里的编排逻辑（react_loop…）。**usage_type**：用量/计费判别器，决定 usage payload 形状。
