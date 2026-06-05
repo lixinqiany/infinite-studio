@@ -1,0 +1,30 @@
+# 仅起开发依赖（Postgres）。前后端在本机裸跑（uvicorn --reload / pnpm dev），不进 compose。
+# 用法（仓库根目录执行）：
+#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose -f docker/docker-compose.yml down
+#   docker compose -f docker/docker-compose.yml logs -f db
+# env 从仓库根 .env 读取（compose 文件在 docker/，故显式指向 ../.env）。
+
+services:
+  db:
+    image: postgres:18
+    container_name: infinite-studio-db
+    # env_file 直接把 POSTGRES_USER/PASSWORD/DB 注入容器环境（路径相对本 compose 文件 = 仓库根 .env）。
+    # 不另写 environment 块：那会触发 compose 宿主侧 ${} 插值，而插值的默认 env 文件不是根 .env，易解析为空。
+    env_file:
+      - ../.env
+    ports:
+      - "5432:5432"
+    volumes:
+      # PG18 改了布局：数据放在 /var/lib/postgresql 下的「主版本子目录」里，
+      # 故挂载点是 /var/lib/postgresql（不再是旧的 .../data），否则镜像报错拒启。
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      # $$ 转义成 $，让容器内 shell 展开（变量来自 env_file），不依赖宿主侧插值。
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
